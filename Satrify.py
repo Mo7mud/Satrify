@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QSizePolicy,
     QGroupBox,
+    QCheckBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QPoint, QRect
 from PyQt6.QtGui import QIcon, QImage, QPixmap, QPalette, QColor, QPainter, QPen
@@ -137,6 +138,7 @@ class VideoDisplayLabel(QLabel):
 
 
 # --- محرك المعالجة ---
+# --- محرك المعالجة ---
 class VideoProcessor(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
@@ -170,6 +172,7 @@ class VideoProcessor(QThread):
         self.start_frame_idx = start_frame_idx
         self.shape = shape
         self.ai_model = ai_model
+        self.show_compare = False  # متغير خيار المقارنة
         self._is_running = True
         logger.info(
             f"Initialized VideoProcessor with mode={mode}, ai_model={ai_model}, input={input_path}"
@@ -238,7 +241,6 @@ class VideoProcessor(QThread):
                         model_path
                     ):
                         self.status_update.emit("Loading AI models (Caffe)...")
-                        # الروابط الجديدة المحدثة
                         self.download_model(
                             "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/deploy.prototxt",
                             prototxt_path,
@@ -254,11 +256,15 @@ class VideoProcessor(QThread):
                     pbtxt_path = os.path.join(models_dir, "opencv_face_detector.pbtxt")
                     pb_path = os.path.join(models_dir, "opencv_face_detector_uint8.pb")
                     if not os.path.isfile(pbtxt_path) or not os.path.isfile(pb_path):
-                        self.status_update.emit('Loading AI models (TensorFlow)...')
-                        # تحميل ملف الوصف
-                        self.download_model("https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/opencv_face_detector.pbtxt", pbtxt_path)
-                        # تحميل نموذج الذكاء الاصطناعي (تم تصحيح الرابط لفرع uint8)
-                        self.download_model("https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20180220_uint8/opencv_face_detector_uint8.pb", pb_path)
+                        self.status_update.emit("Loading AI models (TensorFlow)...")
+                        self.download_model(
+                            "https://raw.githubusercontent.com/opencv/opencv/4.x/samples/dnn/face_detector/opencv_face_detector.pbtxt",
+                            pbtxt_path,
+                        )
+                        self.download_model(
+                            "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20180220_uint8/opencv_face_detector_uint8.pb",
+                            pb_path,
+                        )
                     logger.info("Loading TensorFlow network...")
                     net = cv2.dnn.readNetFromTensorflow(pb_path, pbtxt_path)
 
@@ -288,6 +294,9 @@ class VideoProcessor(QThread):
                 success, frame = cap.read()
                 if not success:
                     break
+
+                # حفظ نسخة من الإطار الأصلي للمقارنة قبل أي تعديل
+                original_frame = frame.copy()
 
                 h_f, w_f = frame.shape[:2]
                 current_faces = []
@@ -337,9 +346,6 @@ class VideoProcessor(QThread):
                         tracker_initialized = True
                         (x, y, w_b, h_b) = [int(v) for v in self.manual_bbox]
                         tracker_box = (x, y, x + w_b, y + h_b)
-                        logger.info(
-                            f"Tracker initialized at frame {current_frame_idx} with bbox {self.manual_bbox}"
-                        )
                     elif tracker_initialized:
                         success_track, box = tracker.update(frame)
                         if success_track:
@@ -433,8 +439,20 @@ class VideoProcessor(QThread):
 
                 out.write(frame)
 
+                # عرض الإطارات وتطبيق خيار المقارنة
                 if current_frame_idx % 3 == 0:
-                    self.frame_update.emit(frame)
+                    if self.show_compare:
+                        h_c, w_c = frame.shape[:2]
+                        if w_c >= h_c:
+                            # فيديو عرضي: النتيجة فوق والأصل تحت
+                            composite = np.vstack((frame, original_frame))
+                        else:
+                            # فيديو طولي: الأصل شمال والنتيجة يمين (أو العكس حسب اللغة)
+                            composite = np.hstack((original_frame, frame))
+                        self.frame_update.emit(composite)
+                    else:
+                        self.frame_update.emit(frame)
+
                     self.frame_idx_update.emit(current_frame_idx)
 
                 current_frame_idx += 1
@@ -583,19 +601,28 @@ class FaceBlurApp(QWidget):
 
         # --- صف الهيدر: اللوجو + العنوان + قائمة اللغات ---
         header_layout = QHBoxLayout()
-        
+
         # 1. اللوجو
         self.lbl_logo = QLabel()
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(script_dir, 'satrify.png')
+        icon_path = os.path.join(script_dir, "satrify.png")
         if os.path.exists(icon_path):
             pixmap = QPixmap(icon_path)
-            self.lbl_logo.setPixmap(pixmap.scaled(35, 35, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        
+            self.lbl_logo.setPixmap(
+                pixmap.scaled(
+                    35,
+                    35,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
         # 2. اسم البرنامج
         self.lbl_title_text = QLabel("Satrify Pro")
-        self.lbl_title_text.setStyleSheet("font-size: 20px; font-weight: bold; color: #4da6ff;")
-        
+        self.lbl_title_text.setStyleSheet(
+            "font-size: 20px; font-weight: bold; color: #4da6ff;"
+        )
+
         # 3. قائمة اللغات
         self.combo_lang = QComboBox()
         self.combo_lang.addItem("English (Default)")
@@ -610,12 +637,12 @@ class FaceBlurApp(QWidget):
         # إضافة العناصر للصف
         header_layout.addWidget(self.lbl_logo)
         header_layout.addWidget(self.lbl_title_text)
-        header_layout.addStretch() # دفع قائمة اللغات لأقصى الطرف الآخر
+        header_layout.addStretch()  # دفع قائمة اللغات لأقصى الطرف الآخر
         header_layout.addWidget(self.combo_lang)
-        
+
         # إضافة الصف بالكامل للوحة التحكم
         self.control_layout.addLayout(header_layout)
-        
+
         # ----------------------------------------------
         # 2. أزرار الملفات
         files_btn_layout = QHBoxLayout()
@@ -805,6 +832,13 @@ class FaceBlurApp(QWidget):
         video_layout.addWidget(self.lbl_preview, stretch=1)
 
         player_layout = QHBoxLayout()
+        
+        # --- إضافة زرار المقارنة هنا تحت الفيديو ---
+        self.check_compare = QCheckBox(self.tr("Compare (Before / After)"))        
+        self.check_compare.setStyleSheet("color: #4da6ff; font-weight: bold;")
+        player_layout.addWidget(self.check_compare)
+        # ----------------------------------------
+        
         self.slider_timeline = QSlider(Qt.Orientation.Horizontal)
         self.slider_timeline.setEnabled(False)
 
@@ -874,6 +908,7 @@ class FaceBlurApp(QWidget):
         self.btn_stop.setText(self.tr("⏹️ Stop"))
         self.lbl_status.setText(self.tr("Ready"))
 
+        self.check_compare.setText(self.tr("Compare (Before / After)"))        
         self.tip_ai.setToolTip(self.tr("tip_ai"))
         self.tip_conf.setToolTip(self.tr("tip_conf"))
         self.tip_mem.setToolTip(self.tr("tip_mem"))
@@ -1080,8 +1115,7 @@ class FaceBlurApp(QWidget):
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.progress_bar.setValue(0)
-
+        self.progress_bar.setValue(0)        
         logger.info("Spawning VideoProcessor thread...")
         self.processor = VideoProcessor(
             self.input_file,
@@ -1096,6 +1130,7 @@ class FaceBlurApp(QWidget):
             shape,
             ai_model,
         )
+        self.processor.show_compare = self.check_compare.isChecked() # تمرير القيمة هنا
         self.processor.progress_update.connect(self.progress_bar.setValue)
         self.processor.status_update.connect(self.update_status_from_processor)
         self.processor.frame_update.connect(self.update_frame)
@@ -1213,7 +1248,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     # ---  تحديد أيقونة النافذة وشريط المهام ---
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    icon_path = os.path.join(script_dir, 'satrify.png')
+    icon_path = os.path.join(script_dir, "satrify.png")
     app.setWindowIcon(QIcon(icon_path))
     # --------------------------------------------------------
     setup_dark_theme(app)
