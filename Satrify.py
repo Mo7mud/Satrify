@@ -227,7 +227,7 @@ class VideoProcessor(QThread):
 
             if self.mode in ["auto", "hybrid"]:
                 script_dir = os.path.dirname(os.path.abspath(__file__))
-                models_dir = os.path.join(script_dir, "models")
+                models_dir = os.path.join(os.path.expanduser("~"), ".satrify_models")
                 if not os.path.exists(models_dir):
                     os.makedirs(models_dir)
                     logger.info("Created 'models' directory.")
