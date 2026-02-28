@@ -16,10 +16,10 @@ A professional, cross-platform desktop application built with Python and OpenCV 
 * **🎛️ Granular Controls:** Adjust detection confidence, memory frames, and pixelation strength in real-time.
 
 ## 📸 Screenshots
-<img width="2312" height="1566" alt="image" src="https://github.com/user-attachments/assets/ecfd87a6-a507-4cfd-8af8-3b0a13704e61" />
 
-<img width="2312" height="1566" alt="image" src="https://github.com/user-attachments/assets/f5a95a90-79a1-476f-abbf-49ae2d021c09" />
+<img width="2344" height="1620" alt="image" src="https://github.com/user-attachments/assets/4f06d014-f0c0-4a24-af40-f457af69b50c" />
 
+<img width="2344" height="1632" alt="image" src="https://github.com/user-attachments/assets/6f09076f-de51-42b6-91b8-7cb7af5d0fb3" />
 
 
 ---
