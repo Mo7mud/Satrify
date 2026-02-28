@@ -7,6 +7,10 @@ import subprocess
 import json
 import logging
 import traceback
+import tempfile
+import shutil
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QApplication,
     QWidget,
@@ -28,20 +32,48 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QPoint, QRect
 from PyQt6.QtGui import QIcon, QImage, QPixmap, QPalette, QColor, QPainter, QPen
+import imageio_ffmpeg
 
-# --- إعداد نظام تسجيل الأحداث (Logging) ---
+
+# --- Global Cross-Platform Helper Functions ---
+def get_real_home():
+    return os.environ.get("SNAP_REAL_HOME", os.path.expanduser("~"))
+
+
+def get_app_data_dir():
+    # الحل الجذري: استخدام المسار الرسمي والمصرح به داخل بيئة Snap
+    if "SNAP_USER_DATA" in os.environ:
+        return os.environ["SNAP_USER_DATA"]
+    # في حالة ويندوز أو ماك، ننشئ مجلد بيانات عادي
+    data_dir = os.path.join(os.path.expanduser("~"), ".satrify_data")
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+def get_standard_output_path(filename="processed_video.mp4"):
+    base_dir = Path(get_real_home()) / "Videos" / "Satrify_Output"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return str(base_dir / filename)
+
+
+def get_temp_video_path():
+    temp_dir = tempfile.gettempdir()
+    return os.path.join(temp_dir, "temp_satrify_no_audio.mp4")
+
+
+# --- Logging Setup ---
 log_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("SatrifyLogger")
 logger.setLevel(logging.INFO)
 
-# طباعة في التيرمينال
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
-# الحفظ في ملف نصي (satrify.log)
 try:
-    file_handler = logging.FileHandler("satrify.log", mode="a", encoding="utf-8")
+    # حفظ ملف اللوج في المسار المصرح به أمنياً
+    log_path = os.path.join(get_app_data_dir(), "satrify_log.txt")
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
     file_handler.setFormatter(log_formatter)
     logger.addHandler(file_handler)
 except Exception as e:
@@ -52,7 +84,7 @@ logger.info("Satrify Application Started")
 logger.info("=========================================")
 
 
-# --- شاشة العرض الذكية ---
+# --- Smart Display Widget ---
 class VideoDisplayLabel(QLabel):
     def __init__(self, text=""):
         super().__init__(text)
@@ -60,7 +92,6 @@ class VideoDisplayLabel(QLabel):
         self.setStyleSheet(
             "background-color: #000000; color: #888; border: 1px solid #444; border-radius: 8px; font-size: 18px;"
         )
-
         self.begin = QPoint()
         self.end = QPoint()
         self.is_drawing = False
@@ -71,18 +102,13 @@ class VideoDisplayLabel(QLabel):
     def get_pixmap_rect(self):
         if not self.pixmap():
             return QRect()
-        pw = self.pixmap().width()
-        ph = self.pixmap().height()
-        lw = self.width()
-        lh = self.height()
-        x = (lw - pw) // 2
-        y = (lh - ph) // 2
-        return QRect(x, y, pw, ph)
+        pw, ph = self.pixmap().width(), self.pixmap().height()
+        lw, lh = self.width(), self.height()
+        return QRect((lw - pw) // 2, (lh - ph) // 2, pw, ph)
 
     def mousePressEvent(self, event):
         if self.drawing_enabled and self.pixmap():
-            self.begin = event.pos()
-            self.end = event.pos()
+            self.begin = self.end = event.pos()
             self.is_drawing = True
             self.roi_rect = None
             self.update()
@@ -103,9 +129,7 @@ class VideoDisplayLabel(QLabel):
         super().paintEvent(event)
         if self.drawing_enabled and self.pixmap():
             painter = QPainter(self)
-            pen = QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.SolidLine)
-            painter.setPen(pen)
-
+            painter.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.SolidLine))
             if self.is_drawing:
                 painter.drawRect(QRect(self.begin, self.end).normalized())
             elif self.roi_rect:
@@ -114,31 +138,22 @@ class VideoDisplayLabel(QLabel):
     def get_video_roi(self):
         if not self.roi_rect or not self.pixmap() or self.video_orig_size == (0, 0):
             return None
-
         pr = self.get_pixmap_rect()
         intersected = self.roi_rect.intersected(pr)
         if intersected.isEmpty():
             return None
 
-        rx = intersected.x() - pr.x()
-        ry = intersected.y() - pr.y()
-        rw = intersected.width()
-        rh = intersected.height()
-
         orig_w, orig_h = self.video_orig_size
-        scale_x = orig_w / pr.width()
-        scale_y = orig_h / pr.height()
-
+        scale_x, scale_y = orig_w / pr.width(), orig_h / pr.height()
         return (
-            int(rx * scale_x),
-            int(ry * scale_y),
-            int(rw * scale_x),
-            int(rh * scale_y),
+            int((intersected.x() - pr.x()) * scale_x),
+            int((intersected.y() - pr.y()) * scale_y),
+            int(intersected.width() * scale_x),
+            int(intersected.height() * scale_y),
         )
 
 
-# --- محرك المعالجة ---
-# --- محرك المعالجة ---
+# --- Video Processing Engine ---
 class VideoProcessor(QThread):
     progress_update = pyqtSignal(int)
     status_update = pyqtSignal(str)
@@ -172,36 +187,25 @@ class VideoProcessor(QThread):
         self.start_frame_idx = start_frame_idx
         self.shape = shape
         self.ai_model = ai_model
-        self.show_compare = False  # متغير خيار المقارنة
+        self.show_compare = False
         self._is_running = True
-        logger.info(
-            f"Initialized VideoProcessor with mode={mode}, ai_model={ai_model}, input={input_path}"
-        )
+        logger.info(f"Initialized VideoProcessor: mode={mode}, model={ai_model}")
 
     def stop(self):
-        logger.info("User requested to stop processing.")
         self._is_running = False
 
     def pixelate_face(self, image, block_percentage):
         h, w = image.shape[:2]
         if h == 0 or w == 0:
             return image
-
         block_size = max(1, int(w * (block_percentage / 100.0)))
-        x_steps = max(1, w // block_size)
-        y_steps = max(1, h // block_size)
-
+        x_steps, y_steps = max(1, w // block_size), max(1, h // block_size)
         small = cv2.resize(image, (x_steps, y_steps), interpolation=cv2.INTER_LINEAR)
         return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
     def download_model(self, url, dest_path):
-        logger.info(f"Downloading model file from: {url}")
-        try:
-            urllib.request.urlretrieve(url, dest_path)
-            logger.info(f"Successfully downloaded to {dest_path}")
-        except Exception as e:
-            logger.error(f"Failed to download {url}: {str(e)}")
-            raise e
+        logger.info(f"Downloading model from: {url}")
+        urllib.request.urlretrieve(url, dest_path)
 
     def run(self):
         try:
@@ -218,7 +222,7 @@ class VideoProcessor(QThread):
                 f"Video Info: {total_frames} frames, {width}x{height}, {fps} FPS"
             )
 
-            temp_video = "temp_video_no_audio.mp4"
+            temp_video = get_temp_video_path()
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             out = cv2.VideoWriter(temp_video, fourcc, fps, (width, height))
 
@@ -226,8 +230,8 @@ class VideoProcessor(QThread):
             haar_cascade = None
 
             if self.mode in ["auto", "hybrid"]:
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                models_dir = os.path.join(os.path.expanduser("~"), ".satrify_models")
+                # --- [التعديل هنا] استخدام المجلد الآمن أمنياً للموديلات ---
+                models_dir = os.path.join(get_app_data_dir(), "models")
                 if not os.path.exists(models_dir):
                     os.makedirs(models_dir)
                     logger.info("Created 'models' directory.")
@@ -295,7 +299,6 @@ class VideoProcessor(QThread):
                 if not success:
                     break
 
-                # حفظ نسخة من الإطار الأصلي للمقارنة قبل أي تعديل
                 original_frame = frame.copy()
 
                 h_f, w_f = frame.shape[:2]
@@ -439,20 +442,16 @@ class VideoProcessor(QThread):
 
                 out.write(frame)
 
-                # عرض الإطارات وتطبيق خيار المقارنة
                 if current_frame_idx % 3 == 0:
                     if self.show_compare:
                         h_c, w_c = frame.shape[:2]
                         if w_c >= h_c:
-                            # فيديو عرضي: النتيجة فوق والأصل تحت
                             composite = np.vstack((frame, original_frame))
                         else:
-                            # فيديو طولي: الأصل شمال والنتيجة يمين (أو العكس حسب اللغة)
                             composite = np.hstack((original_frame, frame))
                         self.frame_update.emit(composite)
                     else:
                         self.frame_update.emit(frame)
-
                     self.frame_idx_update.emit(current_frame_idx)
 
                 current_frame_idx += 1
@@ -473,24 +472,15 @@ class VideoProcessor(QThread):
 
             self.status_update.emit("Merging audio...")
             logger.info("Merging audio using FFmpeg...")
-            command = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                temp_video,
-                "-i",
-                self.input_path,
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                self.output_path,
-            ]
 
+            # [الحل السحري الشامل]: استدعاء النسخة المدمجة والمستقلة من ffmpeg
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            
+            command = [
+                ffmpeg_path, "-y", "-i", temp_video, "-i", self.input_path,
+                "-c:v", "copy", "-c:a", "aac", "-map", "0:v:0", "-map", "1:a:0", self.output_path
+            ]
+            
             try:
                 subprocess.run(
                     command,
@@ -506,7 +496,7 @@ class VideoProcessor(QThread):
                 logger.warning(
                     f"FFmpeg audio merge failed: {e}. Saving video without audio track."
                 )
-                os.rename(temp_video, self.output_path)
+                shutil.move(temp_video, self.output_path)
                 self.finished.emit(True, "Video saved (without audio track).")
 
         except Exception as e:
@@ -516,7 +506,7 @@ class VideoProcessor(QThread):
             self.finished.emit(False, f"Error: {error_msg}")
 
 
-# --- الواجهة الرسومية ---
+# --- Main Application GUI ---
 class FaceBlurApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -525,9 +515,7 @@ class FaceBlurApp(QWidget):
         self.preview_cap = None
         self.current_preview_frame = None
         self.video_fps = 30
-
         self.settings = QSettings("FaceBlurTools", "FaceBlurApp")
-
         self.available_langs = {}
         self.load_locales()
 
@@ -544,72 +532,59 @@ class FaceBlurApp(QWidget):
         self.apply_language()
 
     def load_locales(self):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        locales_dir = os.path.join(script_dir, "locales")
-
+        locales_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "locales"
+        )
         if os.path.exists(locales_dir):
             for filename in os.listdir(locales_dir):
                 if filename.endswith(".json"):
                     try:
-                        filepath = os.path.join(locales_dir, filename)
-                        with open(filepath, "r", encoding="utf-8") as f:
+                        with open(
+                            os.path.join(locales_dir, filename), "r", encoding="utf-8"
+                        ) as f:
                             data = json.load(f)
-                            lang_name = data.get("lang")
-                            if lang_name:
-                                self.available_langs[lang_name] = data
+                            if "lang" in data:
+                                self.available_langs[data["lang"]] = data
                     except Exception as e:
                         logger.error(f"Error loading {filename}: {e}")
 
     def tr(self, text):
-        lang_data = self.available_langs.get(self.current_lang_name, {})
-        translations = lang_data.get("translations", {})
-        return translations.get(text, text)
+        return (
+            self.available_langs.get(self.current_lang_name, {})
+            .get("translations", {})
+            .get(text, text)
+        )
 
     def create_tooltip_icon(self):
         lbl = QLabel("?")
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setFixedSize(18, 18)
         lbl.setStyleSheet(
-            """
-            QLabel {
-                background-color: #555;
-                color: #fff;
-                border-radius: 9px;
-                font-size: 11px;
-                font-weight: bold;
-                margin: 0px;
-            }
-            QLabel:hover {
-                background-color: #2a82da;
-            }
-        """
+            "QLabel { background-color: #555; color: #fff; border-radius: 9px; font-size: 11px; font-weight: bold; margin: 0px; } QLabel:hover { background-color: #2a82da; }"
         )
         return lbl
 
     def initUI(self):
         self.resize(1150, 750)
         self.setStyleSheet("font-size: 14px;")
-
         self.main_layout = QHBoxLayout()
 
-        # --- لوحة التحكم ---
+        # Control Panel
         control_panel = QWidget()
         control_panel.setMaximumWidth(450)
         self.control_layout = QVBoxLayout(control_panel)
         self.control_layout.setContentsMargins(15, 0, 15, 0)
         self.control_layout.setSpacing(10)
 
-        # --- صف الهيدر: اللوجو + العنوان + قائمة اللغات ---
+        # Header Row (Logo + Title + Language)
         header_layout = QHBoxLayout()
-
-        # 1. اللوجو
         self.lbl_logo = QLabel()
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        icon_path = os.path.join(script_dir, "satrify.png")
+        icon_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "satrify.png"
+        )
         if os.path.exists(icon_path):
-            pixmap = QPixmap(icon_path)
             self.lbl_logo.setPixmap(
-                pixmap.scaled(
+                QPixmap(icon_path).scaled(
                     35,
                     35,
                     Qt.AspectRatioMode.KeepAspectRatio,
@@ -617,57 +592,51 @@ class FaceBlurApp(QWidget):
                 )
             )
 
-        # 2. اسم البرنامج
         self.lbl_title_text = QLabel("Satrify Pro")
         self.lbl_title_text.setStyleSheet(
             "font-size: 20px; font-weight: bold; color: #4da6ff;"
         )
 
-        # 3. قائمة اللغات
         self.combo_lang = QComboBox()
         self.combo_lang.addItem("English (Default)")
         for lang in self.available_langs.keys():
             if lang != "English (Default)":
                 self.combo_lang.addItem(lang)
-        index = self.combo_lang.findText(self.current_lang_name)
-        if index >= 0:
-            self.combo_lang.setCurrentIndex(index)
+
+        idx = self.combo_lang.findText(self.current_lang_name)
+        if idx >= 0:
+            self.combo_lang.setCurrentIndex(idx)
         self.combo_lang.currentTextChanged.connect(self.change_language)
 
-        # إضافة العناصر للصف
         header_layout.addWidget(self.lbl_logo)
         header_layout.addWidget(self.lbl_title_text)
-        header_layout.addStretch()  # دفع قائمة اللغات لأقصى الطرف الآخر
+        header_layout.addStretch()
         header_layout.addWidget(self.combo_lang)
-
-        # إضافة الصف بالكامل للوحة التحكم
         self.control_layout.addLayout(header_layout)
 
-        # ----------------------------------------------
-        # 2. أزرار الملفات
+        # File Buttons
         files_btn_layout = QHBoxLayout()
         self.btn_input = QPushButton()
-        self.btn_input.setMinimumHeight(40)
-        self.btn_input.clicked.connect(self.select_input)
-
         self.btn_output = QPushButton()
+        self.btn_input.setMinimumHeight(40)
         self.btn_output.setMinimumHeight(40)
+        self.btn_input.clicked.connect(self.select_input)
         self.btn_output.clicked.connect(self.select_output)
-
         files_btn_layout.addWidget(self.btn_input)
         files_btn_layout.addWidget(self.btn_output)
         self.control_layout.addLayout(files_btn_layout)
 
+        # File Labels
         files_lbl_layout = QHBoxLayout()
         self.lbl_input = QLabel()
-        self.lbl_input.setStyleSheet("color: #aaa; font-size: 12px;")
         self.lbl_output = QLabel()
+        self.lbl_input.setStyleSheet("color: #aaa; font-size: 12px;")
         self.lbl_output.setStyleSheet("color: #aaa; font-size: 12px;")
         files_lbl_layout.addWidget(self.lbl_input)
         files_lbl_layout.addWidget(self.lbl_output)
         self.control_layout.addLayout(files_lbl_layout)
 
-        # 3. إطار وضع الطمس
+        # Mode Selection
         self.grp_mode = QGroupBox()
         mode_btn_layout = QHBoxLayout()
         self.mode_group = QButtonGroup(self)
@@ -676,41 +645,35 @@ class FaceBlurApp(QWidget):
         self.radio_hybrid = QRadioButton()
         self.radio_auto.setChecked(True)
 
-        self.mode_group.addButton(self.radio_auto)
-        self.mode_group.addButton(self.radio_manual)
-        self.mode_group.addButton(self.radio_hybrid)
+        for rb in (self.radio_auto, self.radio_manual, self.radio_hybrid):
+            self.mode_group.addButton(rb)
+            mode_btn_layout.addWidget(rb)
 
-        mode_btn_layout.addWidget(self.radio_auto)
-        mode_btn_layout.addWidget(self.radio_manual)
-        mode_btn_layout.addWidget(self.radio_hybrid)
         self.grp_mode.setLayout(mode_btn_layout)
         self.control_layout.addWidget(self.grp_mode)
-
         self.radio_manual.toggled.connect(self.toggle_drawing_mode)
         self.radio_hybrid.toggled.connect(self.toggle_drawing_mode)
 
-        # 4. إطار شكل الطمس
+        # Shape Selection
         self.grp_shape = QGroupBox()
         shape_layout = QHBoxLayout()
         self.shape_group = QButtonGroup(self)
         self.radio_square = QRadioButton()
         self.radio_circle = QRadioButton()
 
-        saved_shape = str(self.settings.value("shape", "square"))
-        if saved_shape == "circle":
+        if str(self.settings.value("shape", "square")) == "circle":
             self.radio_circle.setChecked(True)
         else:
             self.radio_square.setChecked(True)
 
-        self.shape_group.addButton(self.radio_square)
-        self.shape_group.addButton(self.radio_circle)
+        for rb in (self.radio_square, self.radio_circle):
+            self.shape_group.addButton(rb)
+            shape_layout.addWidget(rb)
 
-        shape_layout.addWidget(self.radio_square)
-        shape_layout.addWidget(self.radio_circle)
         self.grp_shape.setLayout(shape_layout)
         self.control_layout.addWidget(self.grp_shape)
 
-        # 5. إطار الإعدادات
+        # Settings
         self.grp_settings = QGroupBox()
         settings_layout = QVBoxLayout()
         settings_layout.setSpacing(5)
@@ -719,15 +682,18 @@ class FaceBlurApp(QWidget):
         self.lbl_ai = QLabel()
         self.tip_ai = self.create_tooltip_icon()
         self.combo_ai = QComboBox()
-        self.combo_ai.addItem("DNN Caffe (Balanced)", "caffe")
-        self.combo_ai.addItem("DNN TensorFlow (Accurate)", "tf")
-        self.combo_ai.addItem("Haar Cascade (Fast/Frontal)", "haar")
+        self.combo_ai.addItems(
+            [
+                "DNN Caffe (Balanced)",
+                "DNN TensorFlow (Accurate)",
+                "Haar Cascade (Fast/Frontal)",
+            ]
+        )
 
         saved_ai = str(self.settings.value("ai_model", "caffe"))
-        idx = self.combo_ai.findData(saved_ai)
-        if idx >= 0:
-            self.combo_ai.setCurrentIndex(idx)
-
+        idx_ai = self.combo_ai.findData(saved_ai)
+        if idx_ai >= 0:
+            self.combo_ai.setCurrentIndex(idx_ai)
         self.combo_ai.currentIndexChanged.connect(
             lambda: self.settings.setValue("ai_model", self.combo_ai.currentData())
         )
@@ -738,50 +704,37 @@ class FaceBlurApp(QWidget):
         h_ai.addWidget(self.combo_ai)
         settings_layout.addLayout(h_ai)
 
-        conf_val = int(self.settings.value("conf", 30))
-        mem_val = int(self.settings.value("memory", 5))
-        blocks_val = int(self.settings.value("blocks", 15))
-        pad_val = int(self.settings.value("padding", 10))
+        self.slider_conf = self.create_slider(
+            10, 100, int(self.settings.value("conf", 30)), self.update_labels
+        )
+        self.lbl_conf, self.tip_conf = QLabel(), self.create_tooltip_icon()
+        self.add_slider_row(
+            settings_layout, self.lbl_conf, self.tip_conf, self.slider_conf
+        )
 
-        h_conf = QHBoxLayout()
-        self.lbl_conf = QLabel()
-        self.tip_conf = self.create_tooltip_icon()
-        h_conf.addWidget(self.lbl_conf)
-        h_conf.addStretch()
-        h_conf.addWidget(self.tip_conf)
-        self.slider_conf = self.create_slider(10, 100, conf_val, self.update_labels)
-        settings_layout.addLayout(h_conf)
-        settings_layout.addWidget(self.slider_conf)
+        self.slider_memory = self.create_slider(
+            0, 30, int(self.settings.value("memory", 5)), self.update_labels
+        )
+        self.lbl_memory, self.tip_mem = QLabel(), self.create_tooltip_icon()
+        self.add_slider_row(
+            settings_layout, self.lbl_memory, self.tip_mem, self.slider_memory
+        )
 
-        h_mem = QHBoxLayout()
-        self.lbl_memory = QLabel()
-        self.tip_mem = self.create_tooltip_icon()
-        h_mem.addWidget(self.lbl_memory)
-        h_mem.addStretch()
-        h_mem.addWidget(self.tip_mem)
-        self.slider_memory = self.create_slider(0, 30, mem_val, self.update_labels)
-        settings_layout.addLayout(h_mem)
-        settings_layout.addWidget(self.slider_memory)
+        self.slider_blocks = self.create_slider(
+            2, 50, int(self.settings.value("blocks", 15)), self.update_labels
+        )
+        self.lbl_blocks, self.tip_blocks = QLabel(), self.create_tooltip_icon()
+        self.add_slider_row(
+            settings_layout, self.lbl_blocks, self.tip_blocks, self.slider_blocks
+        )
 
-        h_blocks = QHBoxLayout()
-        self.lbl_blocks = QLabel()
-        self.tip_blocks = self.create_tooltip_icon()
-        h_blocks.addWidget(self.lbl_blocks)
-        h_blocks.addStretch()
-        h_blocks.addWidget(self.tip_blocks)
-        self.slider_blocks = self.create_slider(2, 50, blocks_val, self.update_labels)
-        settings_layout.addLayout(h_blocks)
-        settings_layout.addWidget(self.slider_blocks)
-
-        h_pad = QHBoxLayout()
-        self.lbl_padding = QLabel()
-        self.tip_pad = self.create_tooltip_icon()
-        h_pad.addWidget(self.lbl_padding)
-        h_pad.addStretch()
-        h_pad.addWidget(self.tip_pad)
-        self.slider_padding = self.create_slider(0, 50, pad_val, self.update_labels)
-        settings_layout.addLayout(h_pad)
-        settings_layout.addWidget(self.slider_padding)
+        self.slider_padding = self.create_slider(
+            0, 50, int(self.settings.value("padding", 10)), self.update_labels
+        )
+        self.lbl_padding, self.tip_pad = QLabel(), self.create_tooltip_icon()
+        self.add_slider_row(
+            settings_layout, self.lbl_padding, self.tip_pad, self.slider_padding
+        )
 
         self.grp_settings.setLayout(settings_layout)
         self.control_layout.addWidget(self.grp_settings)
@@ -794,54 +747,45 @@ class FaceBlurApp(QWidget):
         self.control_layout.addWidget(self.lbl_status)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)
         self.progress_bar.setFixedHeight(20)
         self.control_layout.addWidget(self.progress_bar)
 
+        # Action Buttons
         buttons_layout = QHBoxLayout()
-
         self.btn_start = QPushButton()
+        self.btn_stop = QPushButton()
         self.btn_start.setMinimumHeight(45)
+        self.btn_stop.setMinimumHeight(45)
         self.btn_start.setStyleSheet(
             "background-color: #28a745; color: white; font-size: 15px; font-weight: bold; border-radius: 6px;"
         )
-        self.btn_start.clicked.connect(self.start_processing)
-
-        self.btn_stop = QPushButton()
-        self.btn_stop.setMinimumHeight(45)
         self.btn_stop.setStyleSheet(
             "background-color: #dc3545; color: white; font-size: 15px; font-weight: bold; border-radius: 6px;"
         )
+        self.btn_start.clicked.connect(self.start_processing)
         self.btn_stop.clicked.connect(self.stop_processing)
         self.btn_stop.setEnabled(False)
 
         buttons_layout.addWidget(self.btn_start)
         buttons_layout.addWidget(self.btn_stop)
-
         self.control_layout.addLayout(buttons_layout)
 
+        # Video Preview Area
         video_layout = QVBoxLayout()
         self.lbl_preview = VideoDisplayLabel()
-
         self.lbl_preview.setSizePolicy(
             QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored
         )
         self.lbl_preview.setMinimumSize(640, 480)
-
         video_layout.addWidget(self.lbl_preview, stretch=1)
 
         player_layout = QHBoxLayout()
-        
-        # --- إضافة زرار المقارنة هنا تحت الفيديو ---
-        self.check_compare = QCheckBox(self.tr("Compare (Before / After)"))        
+        self.check_compare = QCheckBox()
         self.check_compare.setStyleSheet("color: #4da6ff; font-weight: bold;")
         player_layout.addWidget(self.check_compare)
-        # ----------------------------------------
-        
+
         self.slider_timeline = QSlider(Qt.Orientation.Horizontal)
         self.slider_timeline.setEnabled(False)
-
         self.slider_timeline.setTracking(False)
         self.slider_timeline.valueChanged.connect(self.scrub_video)
         self.slider_timeline.sliderMoved.connect(self.update_time_label_only)
@@ -857,8 +801,15 @@ class FaceBlurApp(QWidget):
 
         self.main_layout.addWidget(control_panel, stretch=3)
         self.main_layout.addLayout(video_layout, stretch=7)
-
         self.setLayout(self.main_layout)
+
+    def add_slider_row(self, parent_layout, lbl, tip, slider):
+        h = QHBoxLayout()
+        h.addWidget(lbl)
+        h.addStretch()
+        h.addWidget(tip)
+        parent_layout.addLayout(h)
+        parent_layout.addWidget(slider)
 
     def change_language(self, lang_name):
         if lang_name:
@@ -867,22 +818,17 @@ class FaceBlurApp(QWidget):
             self.apply_language()
 
     def apply_language(self):
-        is_rtl = False
-        if self.current_lang_name in self.available_langs:
-            is_rtl = self.available_langs[self.current_lang_name].get("rtl", False)
-
-        direction = (
+        is_rtl = self.available_langs.get(self.current_lang_name, {}).get("rtl", False)
+        self.setLayoutDirection(
             Qt.LayoutDirection.RightToLeft if is_rtl else Qt.LayoutDirection.LeftToRight
         )
-        self.setLayoutDirection(direction)
 
-        self.setWindowTitle(self.tr("Smart Pixelator - Dark Mode"))
+        self.setWindowTitle(self.tr("Satrify"))
         if not self.input_file:
             self.lbl_preview.setText(self.tr("Select a video to start"))
 
         self.btn_input.setText(self.tr("📁 Open Video"))
         self.btn_output.setText(self.tr("💾 Save As..."))
-
         if not self.input_file:
             self.lbl_input.setText(self.tr("Not selected"))
         if not self.output_file:
@@ -898,17 +844,12 @@ class FaceBlurApp(QWidget):
         self.radio_circle.setText(self.tr("Circle / Ellipse"))
 
         self.grp_settings.setTitle(self.tr("Settings"))
-
         self.lbl_ai.setText(self.tr("AI Model:"))
-        self.combo_ai.setItemText(0, self.tr("DNN Caffe (Balanced)"))
-        self.combo_ai.setItemText(1, self.tr("DNN TensorFlow (Accurate)"))
-        self.combo_ai.setItemText(2, self.tr("Haar Cascade (Fast/Frontal)"))
-
         self.btn_start.setText(self.tr("🚀 Start"))
         self.btn_stop.setText(self.tr("⏹️ Stop"))
         self.lbl_status.setText(self.tr("Ready"))
+        self.check_compare.setText(self.tr("Compare (Before / After)"))
 
-        self.check_compare.setText(self.tr("Compare (Before / After)"))        
         self.tip_ai.setToolTip(self.tr("tip_ai"))
         self.tip_conf.setToolTip(self.tr("tip_conf"))
         self.tip_mem.setToolTip(self.tr("tip_mem"))
@@ -924,25 +865,26 @@ class FaceBlurApp(QWidget):
         self.lbl_preview.drawing_enabled = is_manual_or_hybrid
         self.lbl_preview.roi_rect = None
         self.lbl_preview.update()
-        if is_manual_or_hybrid:
-            self.lbl_preview.setCursor(Qt.CursorShape.CrossCursor)
-        else:
-            self.lbl_preview.setCursor(Qt.CursorShape.ArrowCursor)
+        self.lbl_preview.setCursor(
+            Qt.CursorShape.CrossCursor
+            if is_manual_or_hybrid
+            else Qt.CursorShape.ArrowCursor
+        )
 
     def create_slider(self, min_val, max_val, default_val, connect_func):
         slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setMinimum(min_val)
-        slider.setMaximum(max_val)
+        slider.setRange(min_val, max_val)
         slider.setValue(default_val)
         slider.valueChanged.connect(connect_func)
         return slider
 
     def update_labels(self):
-        conf = self.slider_conf.value()
-        mem = self.slider_memory.value()
-        blocks = self.slider_blocks.value()
-        pad = self.slider_padding.value()
-
+        conf, mem, blocks, pad = (
+            self.slider_conf.value(),
+            self.slider_memory.value(),
+            self.slider_blocks.value(),
+            self.slider_padding.value(),
+        )
         self.lbl_conf.setText(f"{self.tr('Detection Confidence:')} {conf / 100.0:.2f}")
         self.lbl_memory.setText(f"{self.tr('Memory (Frames):')} {mem}")
         self.lbl_blocks.setText(f"{self.tr('Pixelation Strength (%):')} {blocks}")
@@ -962,65 +904,48 @@ class FaceBlurApp(QWidget):
             None, self.tr("📁 Open Video"), "", "Video Files (*.mp4 *.avi *.mkv *.mov)"
         )
         if file:
-            logger.info(f"Selected input file: {file}")
             self.input_file = file
             self.lbl_input.setText(os.path.basename(file))
-
             try:
-                videos_dir = os.path.join(
-                    os.path.expanduser("~"), "Videos", "Satrify_Output"
+                filename, _ = os.path.splitext(os.path.basename(file))
+                self.output_file = get_standard_output_path(f"{filename}_Satrified.mp4")
+                self.lbl_output.setText(
+                    f".../Satrify_Output/{os.path.basename(self.output_file)}"
                 )
-                if not os.path.exists(videos_dir):
-                    os.makedirs(videos_dir)
-
-                filename, ext = os.path.splitext(os.path.basename(file))
-                default_out_name = f"{filename}_Satrified.mp4"
-                self.output_file = os.path.join(videos_dir, default_out_name)
-
-                self.lbl_output.setText(f".../Satrify_Output/{default_out_name}")
             except Exception as e:
                 logger.error(f"Error setting default output: {e}")
 
             if self.preview_cap is not None:
                 self.preview_cap.release()
-
             self.preview_cap = cv2.VideoCapture(self.input_file)
-            orig_w = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            orig_h = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.lbl_preview.video_orig_size = (orig_w, orig_h)
-
-            total_frames = int(self.preview_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.lbl_preview.video_orig_size = (
+                int(self.preview_cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(self.preview_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            )
             self.video_fps = self.preview_cap.get(cv2.CAP_PROP_FPS) or 30.0
 
             self.slider_timeline.setEnabled(True)
-            self.slider_timeline.setMaximum(total_frames - 1)
+            self.slider_timeline.setMaximum(
+                int(self.preview_cap.get(cv2.CAP_PROP_FRAME_COUNT)) - 1
+            )
             self.slider_timeline.setValue(0)
             self.scrub_video(0)
 
     def update_time_label_only(self, frame_idx):
         if self.video_fps > 0:
-            current_time = self.format_time(frame_idx / max(1, self.video_fps))
-            total_time = self.format_time(
-                self.slider_timeline.maximum() / max(1, self.video_fps)
+            self.lbl_time.setText(
+                f"{self.format_time(frame_idx / max(1, self.video_fps))} / {self.format_time(self.slider_timeline.maximum() / max(1, self.video_fps))}"
             )
-            self.lbl_time.setText(f"{current_time} / {total_time}")
 
     def scrub_video(self, frame_idx):
-        if self.preview_cap is not None and self.preview_cap.isOpened():
+        if self.preview_cap and self.preview_cap.isOpened():
             self.preview_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             success, frame = self.preview_cap.read()
             if success:
-                self.current_preview_frame = frame
                 self.update_frame(frame)
-
                 self.lbl_preview.roi_rect = None
                 self.lbl_preview.update()
-
-                current_time = self.format_time(frame_idx / max(1, self.video_fps))
-                total_time = self.format_time(
-                    self.slider_timeline.maximum() / max(1, self.video_fps)
-                )
-                self.lbl_time.setText(f"{current_time} / {total_time}")
+                self.update_time_label_only(frame_idx)
 
     def select_output(self):
         file, _ = QFileDialog.getSaveFileName(
@@ -1034,18 +959,11 @@ class FaceBlurApp(QWidget):
     def update_frame(self, cv_img):
         rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(
-            rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888
-        )
-        pixmap = QPixmap.fromImage(qt_image)
-
-        lbl_w = max(self.lbl_preview.width(), 1)
-        lbl_h = max(self.lbl_preview.height(), 1)
+        qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format.Format_RGB888)
         self.lbl_preview.setPixmap(
-            pixmap.scaled(
-                lbl_w,
-                lbl_h,
+            QPixmap.fromImage(qt_image).scaled(
+                max(self.lbl_preview.width(), 1),
+                max(self.lbl_preview.height(), 1),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
@@ -1058,13 +976,7 @@ class FaceBlurApp(QWidget):
         self.slider_timeline.blockSignals(True)
         self.slider_timeline.setValue(frame_idx)
         self.slider_timeline.blockSignals(False)
-
-        if self.video_fps > 0:
-            current_time = self.format_time(frame_idx / self.video_fps)
-            total_time = self.format_time(
-                self.slider_timeline.maximum() / self.video_fps
-            )
-            self.lbl_time.setText(f"{current_time} / {total_time}")
+        self.update_time_label_only(frame_idx)
 
     def start_processing(self):
         if not self.input_file or not self.output_file:
@@ -1075,62 +987,48 @@ class FaceBlurApp(QWidget):
             )
             return
 
-        if self.radio_auto.isChecked():
-            mode = "auto"
-        elif self.radio_manual.isChecked():
-            mode = "manual"
-        else:
-            mode = "hybrid"
+        mode = (
+            "auto"
+            if self.radio_auto.isChecked()
+            else "manual" if self.radio_manual.isChecked() else "hybrid"
+        )
+        manual_bbox = self.lbl_preview.get_video_roi() if mode != "auto" else None
 
-        shape = "circle" if self.radio_circle.isChecked() else "square"
-        ai_model = self.combo_ai.currentData()
-
-        self.settings.setValue("shape", shape)
-        self.settings.setValue("ai_model", ai_model)
-
-        manual_bbox = None
-        start_frame_idx = 0
-
-        if mode in ["manual", "hybrid"]:
-            manual_bbox = self.lbl_preview.get_video_roi()
-            if not manual_bbox:
-                QMessageBox.warning(
-                    self,
-                    self.tr("Warning"),
-                    self.tr("Please draw a box around the object on the screen first."),
-                )
-                return
-            start_frame_idx = self.slider_timeline.value()
-
-        conf = self.slider_conf.value() / 100.0
-        mem = self.slider_memory.value()
-        blocks_percentage = self.slider_blocks.value()
-        pad = self.slider_padding.value()
-
-        if self.preview_cap is not None:
-            self.preview_cap.release()
-            self.preview_cap = None
-        self.slider_timeline.setEnabled(False)
-        self.lbl_preview.drawing_enabled = False
+        if mode != "auto" and not manual_bbox:
+            QMessageBox.warning(
+                self,
+                self.tr("Warning"),
+                self.tr("Please draw a box around the object on the screen first."),
+            )
+            return
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.progress_bar.setValue(0)        
-        logger.info("Spawning VideoProcessor thread...")
+        self.progress_bar.setValue(0)
+        self.slider_timeline.setEnabled(False)
+        self.lbl_preview.drawing_enabled = False
+        if self.preview_cap:
+            self.preview_cap.release()
+            self.preview_cap = None
+
         self.processor = VideoProcessor(
             self.input_file,
             self.output_file,
-            conf,
-            mem,
-            blocks_percentage,
-            pad,
+            self.slider_conf.value() / 100.0,
+            self.slider_memory.value(),
+            self.slider_blocks.value(),
+            self.slider_padding.value(),
             mode,
             manual_bbox,
-            start_frame_idx,
-            shape,
-            ai_model,
+            self.slider_timeline.value(),
+            "circle" if self.radio_circle.isChecked() else "square",
+            (
+                "caffe"
+                if self.combo_ai.currentIndex() == 0
+                else "tf" if self.combo_ai.currentIndex() == 1 else "haar"
+            ),
         )
-        self.processor.show_compare = self.check_compare.isChecked() # تمرير القيمة هنا
+        self.processor.show_compare = self.check_compare.isChecked()
         self.processor.progress_update.connect(self.progress_bar.setValue)
         self.processor.status_update.connect(self.update_status_from_processor)
         self.processor.frame_update.connect(self.update_frame)
@@ -1160,20 +1058,14 @@ class FaceBlurApp(QWidget):
             msg_box.setIcon(QMessageBox.Icon.Information)
             msg_box.setWindowTitle(self.tr("Success"))
             msg_box.setText(self.tr(message))
-
             btn_play = msg_box.addButton(
                 self.tr("Play Video"), QMessageBox.ButtonRole.ActionRole
             )
-            btn_close = msg_box.addButton(
-                self.tr("Close"), QMessageBox.ButtonRole.RejectRole
-            )
-
+            msg_box.addButton(self.tr("Close"), QMessageBox.ButtonRole.RejectRole)
             msg_box.exec()
 
             if msg_box.clickedButton() == btn_play:
                 try:
-                    import sys
-
                     filepath = os.path.abspath(self.output_file)
                     if sys.platform == "win32":
                         os.startfile(filepath)
@@ -1190,8 +1082,7 @@ class FaceBlurApp(QWidget):
 def setup_dark_theme(app):
     app.setStyle("Fusion")
     dark_palette = QPalette()
-    dark_color = QColor(45, 45, 45)
-    disabled_color = QColor(127, 127, 127)
+    dark_color, disabled_color = QColor(45, 45, 45), QColor(127, 127, 127)
 
     dark_palette.setColor(QPalette.ColorRole.Window, dark_color)
     dark_palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
@@ -1216,22 +1107,9 @@ def setup_dark_theme(app):
 
     app.setStyleSheet(
         """
-        QGroupBox {
-            border: 1px solid #555;
-            border-radius: 6px;
-            margin-top: 15px;
-            padding-top: 15px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            subcontrol-position: top center;
-            padding: 0 5px;
-            color: #4da6ff;
-            font-weight: bold;
-        }
-        QLabel {
-            font-weight: normal;
-        }
+        QGroupBox { border: 1px solid #555; border-radius: 6px; margin-top: 15px; padding-top: 15px; }
+        QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top center; padding: 0 5px; color: #4da6ff; font-weight: bold; }
+        QLabel { font-weight: normal; }
         QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid white; padding: 5px; font-size: 13px; border-radius: 4px; font-weight: normal; }
         QPushButton { border: 1px solid #555; border-radius: 4px; padding: 5px; background-color: #353535; font-weight: bold; }
         QPushButton:hover { background-color: #454545; }
@@ -1246,11 +1124,8 @@ def setup_dark_theme(app):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    # ---  تحديد أيقونة النافذة وشريط المهام ---
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    icon_path = os.path.join(script_dir, "satrify.png")
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "satrify.png")
     app.setWindowIcon(QIcon(icon_path))
-    # --------------------------------------------------------
     setup_dark_theme(app)
     ex = FaceBlurApp()
     ex.show()
