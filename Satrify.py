@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QPoint, QRect
 from PyQt6.QtGui import QIcon, QImage, QPixmap, QPalette, QColor, QPainter, QPen
 import imageio_ffmpeg
-
+import time
 
 # --- Global Cross-Platform Helper Functions ---
 def get_real_home():
@@ -189,11 +189,14 @@ class VideoProcessor(QThread):
         self.ai_model = ai_model
         self.show_compare = False
         self._is_running = True
+        self._is_paused = False
         logger.info(f"Initialized VideoProcessor: mode={mode}, model={ai_model}")
 
     def stop(self):
         self._is_running = False
-
+    def toggle_pause(self):
+        self._is_paused = not getattr(self, "_is_paused", False)
+        return self._is_paused
     def pixelate_face(self, image, block_percentage):
         h, w = image.shape[:2]
         if h == 0 or w == 0:
@@ -295,6 +298,13 @@ class VideoProcessor(QThread):
             current_frame_idx = 0
 
             while cap.isOpened() and self._is_running:
+                if getattr(self, "_is_paused", False):
+                    self.status_update.emit("Paused...")
+                    while self._is_paused and self._is_running:
+                        time.sleep(0.1)  # تنويم المعالج أجزاء من الثانية عشان ميهنجش
+                    if not self._is_running:
+                        break  # لو المستخدم داس إيقاف نهائي وهو في وضع الإيقاف المؤقت
+                    self.status_update.emit("Processing...")
                 success, frame = cap.read()
                 if not success:
                     break
@@ -753,23 +763,29 @@ class FaceBlurApp(QWidget):
         # Action Buttons
         buttons_layout = QHBoxLayout()
         self.btn_start = QPushButton()
+        self.btn_pause = QPushButton() # الزرار الجديد
         self.btn_stop = QPushButton()
+        
         self.btn_start.setMinimumHeight(45)
+        self.btn_pause.setMinimumHeight(45)
         self.btn_stop.setMinimumHeight(45)
-        self.btn_start.setStyleSheet(
-            "background-color: #28a745; color: white; font-size: 15px; font-weight: bold; border-radius: 6px;"
-        )
-        self.btn_stop.setStyleSheet(
-            "background-color: #dc3545; color: white; font-size: 15px; font-weight: bold; border-radius: 6px;"
-        )
+        
+        self.btn_start.setStyleSheet("background-color: #28a745; color: white; font-size: 15px; font-weight: bold; border-radius: 6px;")
+        self.btn_pause.setStyleSheet("background-color: #ffc107; color: black; font-size: 15px; font-weight: bold; border-radius: 6px;")
+        self.btn_stop.setStyleSheet("background-color: #dc3545; color: white; font-size: 15px; font-weight: bold; border-radius: 6px;")
+        
         self.btn_start.clicked.connect(self.start_processing)
+        self.btn_pause.clicked.connect(self.toggle_pause) # ربط الزرار بالدالة
         self.btn_stop.clicked.connect(self.stop_processing)
+        
+        self.btn_pause.setEnabled(False) # مقفول في البداية
         self.btn_stop.setEnabled(False)
 
         buttons_layout.addWidget(self.btn_start)
+        buttons_layout.addWidget(self.btn_pause)
         buttons_layout.addWidget(self.btn_stop)
         self.control_layout.addLayout(buttons_layout)
-
+        
         # Video Preview Area
         video_layout = QVBoxLayout()
         self.lbl_preview = VideoDisplayLabel()
@@ -846,6 +862,7 @@ class FaceBlurApp(QWidget):
         self.grp_settings.setTitle(self.tr("Settings"))
         self.lbl_ai.setText(self.tr("AI Model:"))
         self.btn_start.setText(self.tr("🚀 Start"))
+        self.btn_pause.setText(self.tr("⏸ Pause"))
         self.btn_stop.setText(self.tr("⏹️ Stop"))
         self.lbl_status.setText(self.tr("Ready"))
         self.check_compare.setText(self.tr("Compare (Before / After)"))
@@ -858,6 +875,15 @@ class FaceBlurApp(QWidget):
 
         self.update_labels()
 
+    def toggle_pause(self):
+        # الدالة الجديدة المسؤولة عن ضغطة زرار الإيقاف المؤقت
+        if hasattr(self, "processor") and self.processor.isRunning():
+            is_paused = self.processor.toggle_pause()
+            if is_paused:
+                self.btn_pause.setText(self.tr("▶ Resume"))
+            else:
+                self.btn_pause.setText(self.tr("⏸ Pause"))
+                
     def toggle_drawing_mode(self):
         is_manual_or_hybrid = (
             self.radio_manual.isChecked() or self.radio_hybrid.isChecked()
@@ -1003,6 +1029,8 @@ class FaceBlurApp(QWidget):
             return
 
         self.btn_start.setEnabled(False)
+        self.btn_pause.setEnabled(True) # تشغيل زرار الإيقاف المؤقت
+        self.btn_pause.setText(self.tr("⏸ Pause")) # إعادة ضبط النص
         self.btn_stop.setEnabled(True)
         self.progress_bar.setValue(0)
         self.slider_timeline.setEnabled(False)
@@ -1038,12 +1066,15 @@ class FaceBlurApp(QWidget):
 
     def stop_processing(self):
         if hasattr(self, "processor") and self.processor.isRunning():
+            self.btn_pause.setEnabled(False) # تعطيل الإيقاف المؤقت
             self.btn_stop.setEnabled(False)
             self.lbl_status.setText(self.tr("Stopping processing safely..."))
             self.processor.stop()
 
     def on_finished(self, success, message):
         logger.info(f"Processor finished. Success: {success}, Message: {message}")
+        self.btn_pause.setEnabled(False) # تعطيل الإيقاف المؤقت
+        self.btn_pause.setText(self.tr("⏸ Pause"))
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.lbl_status.setText(self.tr(message))
