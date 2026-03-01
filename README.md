@@ -5,6 +5,9 @@
 ![OpenCV](https://img.shields.io/badge/OpenCV-AI%20Tracking-red?logo=opencv)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
+[![Get it from the Snap Store](https://snapcraft.io/en/dark/install.svg)](https://snapcraft.io/satrify)
+
+
 A professional, cross-platform desktop application built with Python and OpenCV for automatically blurring faces and manually tracking objects in videos to protect privacy. 
 
 ## ✨ Key Features
