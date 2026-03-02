@@ -602,7 +602,7 @@ class FaceBlurApp(QWidget):
                 )
             )
 
-        self.lbl_title_text = QLabel("Satrify Pro")
+        self.lbl_title_text = QLabel("Satrify")
         self.lbl_title_text.setStyleSheet(
             "font-size: 20px; font-weight: bold; color: #4da6ff;"
         )
